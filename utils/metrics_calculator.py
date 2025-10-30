@@ -10,12 +10,14 @@ from typing import List, Dict, Optional, Any, Tuple
 from collections import defaultdict, Counter
 import statistics
 from dataclasses import dataclass
+import logging
 
 from models.core import Commit, PullRequest, Issue, Review
 from models.metrics import (
     CommitMetrics, PRMetrics, VelocityPoint, MetricPeriod,
     ProductivityMetrics
 )
+from utils.error_handler import error_handler, with_error_handling, safe_execute
 
 
 class MetricsCalculator:
@@ -23,11 +25,12 @@ class MetricsCalculator:
     
     def __init__(self):
         """Initialize metrics calculator."""
-        pass
+        self.logger = logging.getLogger(__name__)
     
+    @with_error_handling(context="MetricsCalculator.calculate_commit_metrics")
     def calculate_commit_metrics(self, commits: List[Commit]) -> CommitMetrics:
         """
-        Calculate commit-related productivity metrics.
+        Calculate commit-related productivity metrics with error handling.
         
         Args:
             commits: List of commits to analyze
@@ -36,6 +39,7 @@ class MetricsCalculator:
             CommitMetrics: Calculated commit metrics
         """
         if not commits:
+            self.logger.info("No commits provided for metrics calculation")
             return CommitMetrics(
                 total_commits=0,
                 commit_frequency={},
@@ -45,6 +49,21 @@ class MetricsCalculator:
                 most_active_hours=[],
                 commit_message_length_avg=0.0
             )
+        
+        try:
+            # Validate commit data
+            valid_commits = []
+            for commit in commits:
+                if self._validate_commit_data(commit):
+                    valid_commits.append(commit)
+                else:
+                    self.logger.warning(f"Invalid commit data found: {commit.sha if hasattr(commit, 'sha') else 'unknown'}")
+            
+            if not valid_commits:
+                self.logger.warning("No valid commits found after validation")
+                return self._create_empty_commit_metrics()
+            
+            commits = valid_commits
         
         total_commits = len(commits)
         
@@ -322,3 +341,78 @@ class MetricsCalculator:
             'code_review': (pr_time / total_time) * 100,
             'other': 0.0
         }
+    
+    def _validate_commit_data(self, commit: Commit) -> bool:
+        """Validate commit data for metrics calculation."""
+        try:
+            # Check required fields
+            if not hasattr(commit, 'sha') or not commit.sha:
+                return False
+            
+            if not hasattr(commit, 'timestamp') or not commit.timestamp:
+                return False
+            
+            # Check numeric fields are valid
+            if hasattr(commit, 'additions') and commit.additions < 0:
+                return False
+            
+            if hasattr(commit, 'deletions') and commit.deletions < 0:
+                return False
+            
+            if hasattr(commit, 'files_changed') and commit.files_changed < 0:
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"Error validating commit data: {str(e)}")
+            return False
+    
+    def _validate_pr_data(self, pr: PullRequest) -> bool:
+        """Validate pull request data for metrics calculation."""
+        try:
+            # Check required fields
+            if not hasattr(pr, 'number') or not pr.number:
+                return False
+            
+            if not hasattr(pr, 'created_at') or not pr.created_at:
+                return False
+            
+            # Check numeric fields are valid
+            if hasattr(pr, 'additions') and pr.additions < 0:
+                return False
+            
+            if hasattr(pr, 'deletions') and pr.deletions < 0:
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"Error validating PR data: {str(e)}")
+            return False
+    
+    def _create_empty_commit_metrics(self) -> CommitMetrics:
+        """Create empty commit metrics as fallback."""
+        return CommitMetrics(
+            total_commits=0,
+            commit_frequency={},
+            average_additions=0.0,
+            average_deletions=0.0,
+            average_files_changed=0.0,
+            most_active_hours=[],
+            commit_message_length_avg=0.0
+        )
+    
+    def _create_empty_pr_metrics(self) -> PRMetrics:
+        """Create empty PR metrics as fallback."""
+        return PRMetrics(
+            total_prs=0,
+            merged_prs=0,
+            closed_prs=0,
+            open_prs=0,
+            average_time_to_merge=None,
+            average_additions=0.0,
+            average_deletions=0.0,
+            average_commits_per_pr=0.0,
+            merge_rate=0.0
+        )

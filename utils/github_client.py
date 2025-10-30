@@ -14,6 +14,7 @@ import logging
 
 from models.config import GitHubCredentials, RepositoryConfig
 from models.core import Commit, PullRequest, Issue, Review, PullRequestState, IssueState
+from utils.error_handler import error_handler, with_error_handling, safe_execute
 
 
 class GitHubAPIError(Exception):
@@ -89,7 +90,11 @@ class GitHubClient:
                 raise GitHubAuthenticationError(f"Authentication failed with status {response.status_code}")
                 
         except requests.exceptions.RequestException as e:
+            error_handler.handle_github_api_error(e, "authentication")
             raise GitHubAuthenticationError(f"Network error during authentication: {str(e)}")
+        except Exception as e:
+            error_handler.handle_github_api_error(e, "authentication")
+            raise
     
     def validate_repository_access(self, repo_config: RepositoryConfig) -> bool:
         """
@@ -121,8 +126,13 @@ class GitHubClient:
                 raise GitHubRepositoryError(f"Repository validation failed with status {response.status_code}")
                 
         except requests.exceptions.RequestException as e:
+            error_handler.handle_github_api_error(e, "repository_validation")
             raise GitHubRepositoryError(f"Network error validating repository: {str(e)}")
+        except Exception as e:
+            error_handler.handle_github_api_error(e, "repository_validation")
+            raise
     
+    @with_error_handling(context="GitHubClient.get_commits", fallback=[])
     def get_commits(self, repo_config: RepositoryConfig, since: Optional[datetime] = None, 
                    until: Optional[datetime] = None, author: Optional[str] = None) -> List[Commit]:
         """
@@ -152,32 +162,40 @@ class GitHubClient:
         if author:
             params['author'] = author
         
-        while True:
-            response = self._make_request('GET', endpoint, params=params)
-            
-            if response.status_code != 200:
-                self.logger.error(f"Failed to fetch commits: {response.status_code}")
-                break
-            
-            commit_data = response.json()
-            if not commit_data:
-                break
-            
-            for commit_info in commit_data:
-                try:
-                    # Get detailed commit information
-                    commit_detail = self._get_commit_details(repo_config, commit_info['sha'])
-                    if commit_detail:
-                        commits.append(commit_detail)
-                except Exception as e:
-                    self.logger.warning(f"Failed to process commit {commit_info['sha']}: {str(e)}")
-                    continue
-            
-            # Check if there are more pages
-            if len(commit_data) < 100:
-                break
-            
-            params['page'] += 1
+        try:
+            while True:
+                response = self._make_request('GET', endpoint, params=params)
+                
+                if response.status_code != 200:
+                    error_handler.handle_github_api_error(
+                        Exception(f"Failed to fetch commits: HTTP {response.status_code}"),
+                        "get_commits"
+                    )
+                    break
+                
+                commit_data = response.json()
+                if not commit_data:
+                    break
+                
+                for commit_info in commit_data:
+                    try:
+                        # Get detailed commit information
+                        commit_detail = self._get_commit_details(repo_config, commit_info['sha'])
+                        if commit_detail:
+                            commits.append(commit_detail)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to process commit {commit_info['sha']}: {str(e)}")
+                        continue
+                
+                # Check if there are more pages
+                if len(commit_data) < 100:
+                    break
+                
+                params['page'] += 1
+        
+        except Exception as e:
+            error_handler.handle_github_api_error(e, "get_commits")
+            raise
         
         return commits
     

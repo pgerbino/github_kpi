@@ -16,6 +16,7 @@ from openai.types.chat import ChatCompletion
 
 from models.config import OpenAICredentials
 from models.metrics import ProductivityMetrics, AnalysisReport, Anomaly
+from utils.error_handler import error_handler, with_error_handling, safe_execute
 
 
 class PromptManager:
@@ -227,7 +228,7 @@ class ChatGPTAnalyzer:
         self.logger = logging.getLogger(__name__)
     
     def _make_api_call(self, prompt: str, max_retries: int = 3) -> Optional[str]:
-        """Make API call to ChatGPT with retry logic."""
+        """Make API call to ChatGPT with retry logic and enhanced error handling."""
         for attempt in range(max_retries):
             try:
                 response: ChatCompletion = self.client.chat.completions.create(
@@ -251,12 +252,33 @@ class ChatGPTAnalyzer:
                 
             except Exception as e:
                 self.logger.warning(f"API call attempt {attempt + 1} failed: {str(e)}")
-                if attempt == max_retries - 1:
-                    self.logger.error(f"All API call attempts failed: {str(e)}")
+                
+                # Handle specific OpenAI errors
+                error_str = str(e).lower()
+                if 'rate limit' in error_str and attempt < max_retries - 1:
+                    # Wait longer for rate limit errors
+                    wait_time = (2 ** attempt) * 5  # 5, 10, 20 seconds
+                    self.logger.info(f"Rate limit hit, waiting {wait_time} seconds...")
+                    import time
+                    time.sleep(wait_time)
+                    continue
+                elif 'quota' in error_str or 'billing' in error_str:
+                    # Don't retry quota/billing errors
+                    error_handler.handle_openai_api_error(e, "api_call")
                     raise
+                elif attempt == max_retries - 1:
+                    # Last attempt failed
+                    error_handler.handle_openai_api_error(e, "api_call")
+                    raise
+                else:
+                    # Wait before retry for other errors
+                    wait_time = 2 ** attempt
+                    import time
+                    time.sleep(wait_time)
         
         return None
     
+    @with_error_handling(context="ChatGPTAnalyzer.analyze_productivity_trends")
     def analyze_productivity_trends(self, metrics: ProductivityMetrics) -> AnalysisReport:
         """Generate comprehensive productivity analysis and insights."""
         try:
@@ -264,44 +286,92 @@ class ChatGPTAnalyzer:
             response_text = self._make_api_call(prompt)
             
             if not response_text:
-                raise ValueError("Failed to get response from ChatGPT API")
+                # Create fallback report
+                return self._create_fallback_analysis_report(metrics)
             
             # Parse JSON response
-            response_data = json.loads(response_text)
+            try:
+                response_data = json.loads(response_text)
+            except json.JSONDecodeError as e:
+                self.logger.error(f"Failed to parse ChatGPT response as JSON: {str(e)}")
+                return self._create_fallback_analysis_report(metrics)
             
             # Extract anomalies if present
             anomalies = []
             for anomaly_data in response_data.get('anomalies', []):
-                anomaly = Anomaly(
-                    metric_name=anomaly_data['metric_name'],
-                    timestamp=datetime.now(),  # Current time for analysis
-                    expected_value=0.0,  # Will be set by anomaly detection
-                    actual_value=0.0,   # Will be set by anomaly detection
-                    severity=anomaly_data['severity'],
-                    description=anomaly_data['description']
-                )
-                anomalies.append(anomaly)
+                try:
+                    anomaly = Anomaly(
+                        metric_name=anomaly_data.get('metric_name', 'unknown'),
+                        timestamp=datetime.now(),  # Current time for analysis
+                        expected_value=0.0,  # Will be set by anomaly detection
+                        actual_value=0.0,   # Will be set by anomaly detection
+                        severity=anomaly_data.get('severity', 'LOW'),
+                        description=anomaly_data.get('description', 'No description available')
+                    )
+                    anomalies.append(anomaly)
+                except Exception as e:
+                    self.logger.warning(f"Failed to parse anomaly data: {str(e)}")
+                    continue
             
-            # Create analysis report
+            # Create analysis report with validation
             report = AnalysisReport(
                 generated_at=datetime.now(),
-                summary=response_data.get('summary', 'Analysis completed'),
+                summary=response_data.get('summary', 'Analysis completed successfully'),
                 key_insights=response_data.get('key_insights', []),
                 recommendations=response_data.get('recommendations', []),
                 anomalies=anomalies,
-                confidence_score=response_data.get('confidence_score', 0.8)
+                confidence_score=max(0.0, min(1.0, response_data.get('confidence_score', 0.8)))
             )
             
             self.logger.info("Successfully generated productivity analysis")
             return report
             
-        except json.JSONDecodeError as e:
-            self.logger.error(f"Failed to parse ChatGPT response as JSON: {str(e)}")
-            raise ValueError("Invalid response format from ChatGPT API")
-        
         except Exception as e:
-            self.logger.error(f"Error in productivity analysis: {str(e)}")
-            raise
+            error_handler.handle_openai_api_error(e, "analyze_productivity_trends")
+            return self._create_fallback_analysis_report(metrics)
+    
+    def _create_fallback_analysis_report(self, metrics: ProductivityMetrics) -> AnalysisReport:
+        """Create a fallback analysis report when AI analysis fails."""
+        # Generate basic insights based on metrics
+        insights = []
+        recommendations = []
+        
+        # Basic commit analysis
+        if metrics.commit_metrics.total_commits > 0:
+            daily_avg = metrics.daily_commit_average
+            if daily_avg >= 2:
+                insights.append("High commit frequency indicates active development")
+            elif daily_avg >= 1:
+                insights.append("Moderate commit frequency shows steady progress")
+            else:
+                insights.append("Low commit frequency may indicate larger, less frequent changes")
+                recommendations.append("Consider making more frequent, smaller commits")
+        
+        # Basic PR analysis
+        if metrics.pr_metrics.total_prs > 0:
+            merge_rate = metrics.pr_metrics.merge_rate
+            if merge_rate >= 80:
+                insights.append("High pull request merge rate indicates good code quality")
+            elif merge_rate >= 60:
+                insights.append("Moderate pull request merge rate with room for improvement")
+            else:
+                insights.append("Low pull request merge rate may indicate quality issues")
+                recommendations.append("Focus on improving code quality before submission")
+        
+        # Basic review analysis
+        if metrics.review_metrics.total_reviews_given > 0:
+            insights.append("Active participation in code reviews shows good collaboration")
+        else:
+            recommendations.append("Consider participating more in code reviews")
+        
+        return AnalysisReport(
+            generated_at=datetime.now(),
+            summary=f"Basic analysis completed for {metrics.period_days} day period with {metrics.commit_metrics.total_commits} commits and {metrics.pr_metrics.total_prs} pull requests.",
+            key_insights=insights if insights else ["Analysis data available for review"],
+            recommendations=recommendations if recommendations else ["Continue current development practices"],
+            anomalies=[],
+            confidence_score=0.6  # Lower confidence for fallback analysis
+        )
     
     def identify_anomalies(self, metrics: ProductivityMetrics) -> List[Anomaly]:
         """Identify anomalies and unusual patterns in productivity data."""
@@ -422,7 +492,7 @@ class ChatGPTAnalyzer:
             return test_response.choices[0].message.content is not None
             
         except Exception as e:
-            self.logger.error(f"Credential validation failed: {str(e)}")
+            error_handler.handle_openai_api_error(e, "credential_validation")
             return False
 
 

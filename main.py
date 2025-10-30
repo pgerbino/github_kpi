@@ -16,6 +16,7 @@ from utils.user_feedback import (
 )
 import hashlib
 import json
+import logging
 
 # Dashboard sections
 DASHBOARD_SECTIONS = {
@@ -317,11 +318,16 @@ def perform_integrated_data_collection(github_token: str, repo_owner: str, repo_
         
         # Check cache for pull requests
         update_progress(0.5, "Fetching pull requests...")
+        prs_start_time = time.time()
         prs_cache_key = create_cache_key(repo_owner, repo_name, 'pull_requests')
         pull_requests = get_cached_data(prs_cache_key, 'github_data')
-        
+
+        def pr_progress_callback(current, total, message, estimated_time_remaining):
+            elapsed = time.time() - prs_start_time
+            logging.info(f"Pull request download progress - Request count: {current}, Elapsed time: {elapsed:.2f}s, Status: {message}")
+
         if pull_requests is None:
-            pull_requests = client.get_pull_requests(repo_config, state='all')
+            pull_requests = client.get_pull_requests(repo_config, state='all', progress_callback=pr_progress_callback)
             
             # Limit PRs to most recent 500 for performance
             if len(pull_requests) > 500:

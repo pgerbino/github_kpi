@@ -8,7 +8,7 @@ including authentication, data fetching, rate limiting, and error handling.
 import requests
 import time
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Callable
 from urllib.parse import urljoin
 import logging
 
@@ -199,19 +199,25 @@ class GitHubClient:
         
         return commits
     
-    def get_pull_requests(self, repo_config: RepositoryConfig, state: str = 'all') -> List[PullRequest]:
+    def get_pull_requests(self, repo_config: RepositoryConfig, state: str = 'all', progress_callback: Optional[Callable[[int, int, str, float], None]] = None) -> List[PullRequest]:
         """
         Retrieve pull requests for a repository.
-        
+
         Args:
             repo_config: Repository configuration
             state: PR state filter ('open', 'closed', 'all')
-            
+            progress_callback: Optional callback for progress reporting (current, total, message, estimated_time_remaining)
+
         Returns:
             List[PullRequest]: List of pull requests
         """
         pull_requests = []
         endpoint = f'/repos/{repo_config.owner}/{repo_config.name}/pulls'
+
+        # Progress tracking
+        start_time = time.time()
+        request_count = 0
+        page = 1
         
         params = {
             'state': state,
@@ -222,31 +228,48 @@ class GitHubClient:
         }
         
         while True:
+            status = f"Fetching pull requests page {page}"
+            if progress_callback:
+                progress_callback(request_count, -1, status, -1.0)
+            self.logger.info(f"Progress: {status}")
+
             response = self._make_request('GET', endpoint, params=params)
-            
+            request_count += 1
+            elapsed = time.time() - start_time
+            self.logger.info(f"API request completed: {request_count} requests made, elapsed time: {elapsed:.2f}s")
+
+            if progress_callback:
+                progress_callback(request_count, -1, f"Page {page} fetched", -1.0)
+
             if response.status_code != 200:
                 self.logger.error(f"Failed to fetch pull requests: {response.status_code}")
                 break
-            
+
             pr_data = response.json()
             if not pr_data:
                 break
-            
-            for pr_info in pr_data:
+
+            for i, pr_info in enumerate(pr_data):
+                status = f"Processing PR #{pr_info['number']} ({i+1}/{len(pr_data)} on page {page})"
+                if progress_callback:
+                    progress_callback(request_count, -1, status, -1.0)
+                self.logger.info(f"Progress: {status}")
+
                 try:
                     # Get detailed PR information including reviews
-                    pr_detail = self._get_pull_request_details(repo_config, pr_info['number'])
+                    pr_detail = self._get_pull_request_details(repo_config, pr_info['number'], progress_callback)
                     if pr_detail:
                         pull_requests.append(pr_detail)
                 except Exception as e:
                     self.logger.warning(f"Failed to process PR #{pr_info['number']}: {str(e)}")
                     continue
-            
+
             # Check if there are more pages
             if len(pr_data) < 100:
                 break
-            
+
             params['page'] += 1
+            page += 1
         
         return pull_requests
     
@@ -439,10 +462,14 @@ class GitHubClient:
         commit_data = response.json()
         return self._parse_commit(commit_data)
     
-    def _get_pull_request_details(self, repo_config: RepositoryConfig, pr_number: int) -> Optional[PullRequest]:
+    def _get_pull_request_details(self, repo_config: RepositoryConfig, pr_number: int, progress_callback: Optional[Callable[[int, int, str, float], None]] = None) -> Optional[PullRequest]:
         """Get detailed pull request information including reviews."""
         # Get PR details
         pr_endpoint = f'/repos/{repo_config.owner}/{repo_config.name}/pulls/{pr_number}'
+        status = f"Fetching details for PR #{pr_number}"
+        if progress_callback:
+            progress_callback(-1, -1, status, -1.0)
+        self.logger.info(f"Progress: {status}")
         pr_response = self._make_request('GET', pr_endpoint)
         
         if pr_response.status_code != 200:
@@ -452,6 +479,10 @@ class GitHubClient:
         
         # Get PR reviews
         reviews_endpoint = f'/repos/{repo_config.owner}/{repo_config.name}/pulls/{pr_number}/reviews'
+        status = f"Fetching reviews for PR #{pr_number}"
+        if progress_callback:
+            progress_callback(-1, -1, status, -1.0)
+        self.logger.info(f"Progress: {status}")
         reviews_response = self._make_request('GET', reviews_endpoint)
         
         reviews = []

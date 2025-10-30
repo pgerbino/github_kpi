@@ -181,25 +181,37 @@ def validate_openai_key(key: str) -> bool:
 
 def validate_repository_url(url: str) -> tuple[bool, str, str]:
     """Validate GitHub repository URL and extract owner/name"""
-    if not url:
+    if not url or not url.strip():
         return False, "", ""
+    
+    # Strip whitespace
+    url = url.strip()
     
     import re
     # Support both full URLs and owner/repo format
     if url.startswith('https://github.com/'):
-        pattern = r'https://github\.com/([^/]+)/([^/]+)/?'
+        pattern = r'^https://github\.com/([a-zA-Z0-9_.-]+)/([a-zA-Z0-9_.-]+?)(?:\.git)?/?$'
         match = re.match(pattern, url)
         if match:
             owner, name = match.groups()
+            # Remove .git suffix if present
             if name.endswith('.git'):
                 name = name[:-4]
-            return True, owner, name
+            # Validate owner and name are not empty
+            if owner and name and owner != '.' and name != '.':
+                return True, owner, name
     elif '/' in url and not url.startswith('http'):
-        # Handle owner/repo format
+        # Handle owner/repo format - must be exactly owner/repo
         parts = url.split('/')
         if len(parts) == 2:
             owner, name = parts
-            return True, owner, name
+            # Validate both parts are non-empty and valid
+            if (owner and name and 
+                owner.strip() and name.strip() and
+                not owner.endswith('/') and not name.startswith('/') and
+                re.match(r'^[a-zA-Z0-9_.-]+$', owner) and
+                re.match(r'^[a-zA-Z0-9_.-]+$', name)):
+                return True, owner.strip(), name.strip()
     
     return False, "", ""
 

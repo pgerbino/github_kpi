@@ -65,6 +65,10 @@ class MetricsCalculator:
             
             commits = valid_commits
         
+        except Exception as e:
+            self.logger.error(f"Error validating commit data: {str(e)}")
+            # Continue with original commits if validation fails
+        
         total_commits = len(commits)
         
         # Calculate frequency by different periods

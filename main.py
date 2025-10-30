@@ -8,12 +8,14 @@ and AI-powered insights from ChatGPT.
 import streamlit as st
 import time
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from utils.error_handler import error_handler, with_error_handling, safe_execute
 from utils.user_feedback import (
     feedback_manager, loading_context, show_success, show_error, 
     show_warning, show_info, is_loading, set_loading, set_success, set_error
 )
+import hashlib
+import json
 
 # Dashboard sections
 DASHBOARD_SECTIONS = {
@@ -38,6 +40,130 @@ def initialize_session_state():
         st.session_state.credentials_valid = False
     if 'data_loaded' not in st.session_state:
         st.session_state.data_loaded = False
+    
+    # Initialize caching system
+    if 'github_data_cache' not in st.session_state:
+        st.session_state.github_data_cache = {}
+    if 'metrics_cache' not in st.session_state:
+        st.session_state.metrics_cache = {}
+    if 'cache_timestamps' not in st.session_state:
+        st.session_state.cache_timestamps = {}
+    if 'performance_metrics' not in st.session_state:
+        st.session_state.performance_metrics = {
+            'data_load_time': 0,
+            'metrics_calc_time': 0,
+            'chart_render_time': 0,
+            'api_calls_made': 0,
+            'cache_hits': 0,
+            'cache_misses': 0
+        }
+
+def create_cache_key(repo_owner: str, repo_name: str, data_type: str, 
+                    since_date: datetime = None, **kwargs) -> str:
+    """
+    Create a unique cache key for GitHub data.
+    
+    Args:
+        repo_owner: Repository owner
+        repo_name: Repository name  
+        data_type: Type of data (commits, prs, issues)
+        since_date: Optional date filter
+        **kwargs: Additional parameters for cache key
+    
+    Returns:
+        str: Unique cache key
+    """
+    key_data = {
+        'repo': f"{repo_owner}/{repo_name}",
+        'type': data_type,
+        'since': since_date.isoformat() if since_date else None,
+        **kwargs
+    }
+    
+    key_string = json.dumps(key_data, sort_keys=True, default=str)
+    return hashlib.md5(key_string.encode()).hexdigest()
+
+def is_cache_valid(cache_key: str, max_age_minutes: int = 30) -> bool:
+    """
+    Check if cached data is still valid based on timestamp.
+    
+    Args:
+        cache_key: Cache key to check
+        max_age_minutes: Maximum age in minutes before cache expires
+    
+    Returns:
+        bool: True if cache is valid
+    """
+    if cache_key not in st.session_state.cache_timestamps:
+        return False
+    
+    cache_time = st.session_state.cache_timestamps[cache_key]
+    age_minutes = (datetime.now() - cache_time).total_seconds() / 60
+    
+    return age_minutes < max_age_minutes
+
+def get_cached_data(cache_key: str, data_type: str):
+    """
+    Retrieve data from cache if valid.
+    
+    Args:
+        cache_key: Cache key
+        data_type: Type of data being retrieved
+    
+    Returns:
+        Cached data or None if not available/expired
+    """
+    if not is_cache_valid(cache_key):
+        return None
+    
+    if data_type == 'github_data':
+        cache = st.session_state.github_data_cache
+    elif data_type == 'metrics':
+        cache = st.session_state.metrics_cache
+    else:
+        return None
+    
+    if cache_key in cache:
+        st.session_state.performance_metrics['cache_hits'] += 1
+        return cache[cache_key]
+    
+    return None
+
+def cache_data(cache_key: str, data: Any, data_type: str):
+    """
+    Store data in cache with timestamp.
+    
+    Args:
+        cache_key: Cache key
+        data: Data to cache
+        data_type: Type of data being cached
+    """
+    if data_type == 'github_data':
+        cache = st.session_state.github_data_cache
+    elif data_type == 'metrics':
+        cache = st.session_state.metrics_cache
+    else:
+        return
+    
+    cache[cache_key] = data
+    st.session_state.cache_timestamps[cache_key] = datetime.now()
+    st.session_state.performance_metrics['cache_misses'] += 1
+
+def clear_expired_cache():
+    """Clear expired cache entries to free memory."""
+    current_time = datetime.now()
+    expired_keys = []
+    
+    for cache_key, timestamp in st.session_state.cache_timestamps.items():
+        age_minutes = (current_time - timestamp).total_seconds() / 60
+        if age_minutes > 60:  # Clear cache older than 1 hour
+            expired_keys.append(cache_key)
+    
+    for key in expired_keys:
+        # Remove from all caches
+        st.session_state.github_data_cache.pop(key, None)
+        st.session_state.metrics_cache.pop(key, None)
+        st.session_state.cache_timestamps.pop(key, None)
 
 def validate_github_token(token: str) -> bool:
     """Validate GitHub token format"""
@@ -109,6 +235,363 @@ def test_github_connection(token: str, repo_owner: str, repo_name: str) -> tuple
     except Exception as e:
         error_info = error_handler.handle_github_api_error(e, "connection_test")
         return False, f"Connection failed: {error_info.get('message', str(e))}"
+
+@with_error_handling(context="integrated_data_collection", fallback=False)
+def perform_integrated_data_collection(github_token: str, repo_owner: str, repo_name: str, 
+                                     update_progress) -> bool:
+    """
+    Perform integrated end-to-end data collection workflow with caching optimization.
+    
+    This function integrates GitHub data collection with metrics processing and visualization
+    to test the complete workflow from credential input to insight generation.
+    Implements caching to minimize API calls and improve performance.
+    
+    Args:
+        github_token: GitHub personal access token
+        repo_owner: Repository owner name
+        repo_name: Repository name
+        update_progress: Progress update callback function
+    
+    Returns:
+        bool: True if data collection was successful
+    """
+    from models.config import GitHubCredentials, RepositoryConfig
+    from utils.github_client import GitHubClient
+    from utils.metrics_calculator import MetricsCalculator
+    from datetime import datetime, timedelta
+    
+    start_time = time.time()
+    
+    try:
+        # Clear expired cache entries
+        clear_expired_cache()
+        
+        # Step 1: Initialize GitHub client and authenticate
+        update_progress(0.1, "Initializing GitHub API client...")
+        credentials = GitHubCredentials(personal_access_token=github_token)
+        client = GitHubClient(credentials)
+        
+        if not client.authenticate():
+            raise Exception("GitHub authentication failed")
+        
+        # Step 2: Validate repository access
+        update_progress(0.2, "Validating repository access...")
+        repo_config = RepositoryConfig(owner=repo_owner, name=repo_name)
+        
+        if not client.validate_repository_access(repo_config):
+            raise Exception(f"Cannot access repository {repo_owner}/{repo_name}")
+        
+        # Step 3: Collect GitHub data with caching
+        since_date = datetime.now() - timedelta(days=30)
+        
+        # Check cache for commits
+        update_progress(0.3, "Fetching commit history...")
+        commits_cache_key = create_cache_key(repo_owner, repo_name, 'commits', since_date)
+        commits = get_cached_data(commits_cache_key, 'github_data')
+        
+        if commits is None:
+            # Optimize by limiting data collection for performance
+            commits = client.get_commits(repo_config, since=since_date)
+            
+            # Limit commits to most recent 1000 for performance
+            if len(commits) > 1000:
+                commits = commits[:1000]
+                update_progress(0.35, f"Optimized: Using {len(commits)} most recent commits...")
+            
+            cache_data(commits_cache_key, commits, 'github_data')
+            st.session_state.performance_metrics['api_calls_made'] += 1
+        else:
+            update_progress(0.4, "Using cached commit data...")
+        
+        # Check cache for pull requests
+        update_progress(0.5, "Fetching pull requests...")
+        prs_cache_key = create_cache_key(repo_owner, repo_name, 'pull_requests')
+        pull_requests = get_cached_data(prs_cache_key, 'github_data')
+        
+        if pull_requests is None:
+            pull_requests = client.get_pull_requests(repo_config, state='all')
+            
+            # Limit PRs to most recent 500 for performance
+            if len(pull_requests) > 500:
+                pull_requests = pull_requests[:500]
+                update_progress(0.52, f"Optimized: Using {len(pull_requests)} most recent PRs...")
+            
+            cache_data(prs_cache_key, pull_requests, 'github_data')
+            st.session_state.performance_metrics['api_calls_made'] += 1
+        else:
+            update_progress(0.55, "Using cached pull request data...")
+        
+        # Check cache for issues
+        update_progress(0.6, "Fetching issues...")
+        issues_cache_key = create_cache_key(repo_owner, repo_name, 'issues')
+        issues = get_cached_data(issues_cache_key, 'github_data')
+        
+        if issues is None:
+            issues = client.get_issues(repo_config, state='all')
+            
+            # Limit issues to most recent 300 for performance
+            if len(issues) > 300:
+                issues = issues[:300]
+                update_progress(0.62, f"Optimized: Using {len(issues)} most recent issues...")
+            
+            cache_data(issues_cache_key, issues, 'github_data')
+            st.session_state.performance_metrics['api_calls_made'] += 1
+        else:
+            update_progress(0.65, "Using cached issue data...")
+        
+        # Step 4: Process and calculate metrics with caching
+        update_progress(0.7, "Processing data and calculating metrics...")
+        
+        # Check cache for calculated metrics
+        metrics_cache_key = create_cache_key(
+            repo_owner, repo_name, 'metrics', since_date,
+            commits_count=len(commits), prs_count=len(pull_requests), issues_count=len(issues)
+        )
+        
+        cached_metrics = get_cached_data(metrics_cache_key, 'metrics')
+        
+        if cached_metrics is None:
+            calc_start_time = time.time()
+            calculator = MetricsCalculator()
+            
+            # Calculate productivity metrics
+            commit_metrics = calculator.calculate_commit_metrics(commits)
+            pr_metrics = calculator.calculate_pr_metrics(pull_requests)
+            
+            # Use review metrics processor for review and issue metrics
+            from utils.review_metrics_processor import ReviewMetricsProcessor
+            processor = ReviewMetricsProcessor()
+            review_metrics = processor.calculate_review_metrics(pull_requests)
+            issue_metrics = processor.calculate_issue_metrics(issues)
+            
+            update_progress(0.8, "Generating velocity trends...")
+            velocity_trends = calculator.generate_time_series_data(commits, pull_requests, issues)
+            time_distribution = calculator._calculate_time_distribution(commits, pull_requests)
+            
+            # Cache the calculated metrics
+            metrics_data = {
+                'commit_metrics': commit_metrics,
+                'pr_metrics': pr_metrics,
+                'review_metrics': review_metrics,
+                'issue_metrics': issue_metrics,
+                'velocity_trends': velocity_trends,
+                'time_distribution': time_distribution
+            }
+            cache_data(metrics_cache_key, metrics_data, 'metrics')
+            
+            calc_time = time.time() - calc_start_time
+            st.session_state.performance_metrics['metrics_calc_time'] = calc_time
+        else:
+            update_progress(0.85, "Using cached metrics...")
+            commit_metrics = cached_metrics['commit_metrics']
+            pr_metrics = cached_metrics['pr_metrics']
+            review_metrics = cached_metrics['review_metrics']
+            issue_metrics = cached_metrics['issue_metrics']
+            velocity_trends = cached_metrics['velocity_trends']
+            time_distribution = cached_metrics['time_distribution']
+        
+        # Step 5: Create integrated metrics object
+        update_progress(0.9, "Finalizing metrics integration...")
+        from models.metrics import ProductivityMetrics
+        
+        integrated_metrics = ProductivityMetrics(
+            period_start=since_date,
+            period_end=datetime.now(),
+            commit_metrics=commit_metrics,
+            pr_metrics=pr_metrics,
+            review_metrics=review_metrics,
+            issue_metrics=issue_metrics,
+            velocity_trends=velocity_trends,
+            time_distribution=time_distribution
+        )
+        
+        # Step 6: Store metrics in session state for dashboard use
+        update_progress(0.95, "Storing metrics for dashboard...")
+        st.session_state.integrated_metrics = integrated_metrics
+        st.session_state.repository_info = {
+            'owner': repo_owner,
+            'name': repo_name,
+            'last_updated': datetime.now(),
+            'data_points': {
+                'commits': len(commits),
+                'pull_requests': len(pull_requests),
+                'issues': len(issues)
+            },
+            'cache_performance': {
+                'cache_hits': st.session_state.performance_metrics['cache_hits'],
+                'cache_misses': st.session_state.performance_metrics['cache_misses'],
+                'api_calls_made': st.session_state.performance_metrics['api_calls_made']
+            }
+        }
+        
+        # Record total data load time
+        total_time = time.time() - start_time
+        st.session_state.performance_metrics['data_load_time'] = total_time
+        
+        update_progress(1.0, "Data collection complete!")
+        return True
+        
+    except Exception as e:
+        error_handler.handle_github_api_error(e, "integrated_data_collection")
+        raise Exception(f"Integrated data collection failed: {str(e)}")
+
+@with_error_handling(context="test_end_to_end_workflow", fallback=False)
+def test_end_to_end_workflow(github_token: str, repo_owner: str, repo_name: str, 
+                           openai_key: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Test complete end-to-end workflow from credential input to insight generation.
+    
+    This function tests the complete integration of all components:
+    1. GitHub data collection
+    2. Metrics processing and visualization
+    3. AI insights generation (if OpenAI key provided)
+    4. Export functionality
+    
+    Args:
+        github_token: GitHub personal access token
+        repo_owner: Repository owner name
+        repo_name: Repository name
+        openai_key: Optional OpenAI API key for AI insights
+    
+    Returns:
+        Dict containing test results and metrics
+    """
+    test_results = {
+        'success': False,
+        'steps_completed': [],
+        'errors': [],
+        'metrics_summary': {},
+        'ai_insights_available': False,
+        'export_ready': False
+    }
+    
+    try:
+        # Step 1: Test GitHub data collection
+        from models.config import GitHubCredentials, RepositoryConfig
+        from utils.github_client import GitHubClient
+        from utils.metrics_calculator import MetricsCalculator
+        from datetime import datetime, timedelta
+        
+        credentials = GitHubCredentials(personal_access_token=github_token)
+        client = GitHubClient(credentials)
+        
+        if not client.authenticate():
+            test_results['errors'].append("GitHub authentication failed")
+            return test_results
+        
+        test_results['steps_completed'].append("GitHub authentication")
+        
+        repo_config = RepositoryConfig(owner=repo_owner, name=repo_name)
+        if not client.validate_repository_access(repo_config):
+            test_results['errors'].append("Repository access validation failed")
+            return test_results
+        
+        test_results['steps_completed'].append("Repository access validation")
+        
+        # Collect sample data
+        since_date = datetime.now() - timedelta(days=7)  # Smaller sample for testing
+        commits = client.get_commits(repo_config, since=since_date)
+        pull_requests = client.get_pull_requests(repo_config, state='all')
+        issues = client.get_issues(repo_config, state='all')
+        
+        test_results['steps_completed'].append("GitHub data collection")
+        test_results['metrics_summary']['data_points'] = {
+            'commits': len(commits),
+            'pull_requests': len(pull_requests),
+            'issues': len(issues)
+        }
+        
+        # Step 2: Test metrics processing
+        calculator = MetricsCalculator()
+        commit_metrics = calculator.calculate_commit_metrics(commits)
+        pr_metrics = calculator.calculate_pr_metrics(pull_requests)
+        
+        # Use review metrics processor for review and issue metrics
+        from utils.review_metrics_processor import ReviewMetricsProcessor
+        processor = ReviewMetricsProcessor()
+        review_metrics = processor.calculate_review_metrics(pull_requests)
+        issue_metrics = processor.calculate_issue_metrics(issues)
+        velocity_trends = calculator.generate_time_series_data(commits, pull_requests, issues)
+        
+        test_results['steps_completed'].append("Metrics calculation")
+        test_results['metrics_summary']['calculated_metrics'] = {
+            'total_commits': commit_metrics.total_commits,
+            'total_prs': pr_metrics.total_prs,
+            'total_reviews': review_metrics.total_reviews_given,
+            'total_issues': issue_metrics.total_issues
+        }
+        
+        # Step 3: Test AI insights generation (if OpenAI key provided)
+        if openai_key:
+            try:
+                from models.config import OpenAICredentials
+                from utils.chatgpt_analyzer import ChatGPTAnalyzer
+                from models.metrics import ProductivityMetrics
+                
+                # Create integrated metrics for AI analysis
+                integrated_metrics = ProductivityMetrics(
+                    period_start=since_date,
+                    period_end=datetime.now(),
+                    commit_metrics=commit_metrics,
+                    pr_metrics=pr_metrics,
+                    review_metrics=review_metrics,
+                    issue_metrics=issue_metrics,
+                    velocity_trends=velocity_trends,
+                    time_distribution=calculator.calculate_time_distribution(commits, pull_requests)
+                )
+                
+                openai_credentials = OpenAICredentials(api_key=openai_key)
+                analyzer = ChatGPTAnalyzer(openai_credentials)
+                
+                if analyzer.validate_credentials():
+                    # Test AI analysis generation
+                    analysis_report = analyzer.analyze_productivity_trends(integrated_metrics)
+                    test_results['steps_completed'].append("AI insights generation")
+                    test_results['ai_insights_available'] = True
+                    test_results['metrics_summary']['ai_analysis'] = {
+                        'summary_length': len(analysis_report.summary),
+                        'insights_count': len(analysis_report.key_insights),
+                        'recommendations_count': len(analysis_report.recommendations),
+                        'confidence_score': analysis_report.confidence_score
+                    }
+                else:
+                    test_results['errors'].append("OpenAI credentials validation failed")
+                    
+            except Exception as e:
+                test_results['errors'].append(f"AI insights generation failed: {str(e)}")
+        
+        # Step 4: Test export functionality
+        try:
+            from utils.export_manager import ExportManager
+            export_manager = ExportManager()
+            
+            # Test CSV export
+            csv_content = export_manager.csv_exporter.export_productivity_metrics(
+                integrated_metrics, include_config=True
+            )
+            
+            if csv_content and len(csv_content) > 100:  # Basic validation
+                test_results['steps_completed'].append("CSV export generation")
+                test_results['export_ready'] = True
+                test_results['metrics_summary']['export'] = {
+                    'csv_size_kb': len(csv_content.encode('utf-8')) / 1024,
+                    'csv_lines': len(csv_content.split('\n'))
+                }
+            else:
+                test_results['errors'].append("CSV export validation failed")
+                
+        except Exception as e:
+            test_results['errors'].append(f"Export functionality test failed: {str(e)}")
+        
+        # Mark as successful if core workflow completed
+        if len(test_results['steps_completed']) >= 3:  # At minimum: auth, data collection, metrics
+            test_results['success'] = True
+        
+        return test_results
+        
+    except Exception as e:
+        test_results['errors'].append(f"End-to-end workflow test failed: {str(e)}")
+        return test_results
 
 @with_error_handling(context="test_openai_connection", fallback=(False, "OpenAI connection test failed"))
 def test_openai_connection(api_key: str) -> tuple[bool, str]:
@@ -287,36 +770,116 @@ def render_configuration_panel():
     if st.session_state.credentials_valid:
         st.success("🎉 Configuration Complete! You can now load data and analyze productivity.")
         
-        # Load Data button
-        if st.button("📊 Load Repository Data", type="primary", disabled=is_loading("data_loading")):
-            with loading_context("data_loading", "Loading repository data...") as update_progress:
-                try:
-                    update_progress(0.1, "Initializing data collection...")
+        # Test End-to-End Workflow button
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🧪 Test Complete Workflow", help="Test the complete end-to-end workflow"):
+                with st.spinner("Testing complete workflow..."):
+                    test_results = test_end_to_end_workflow(
+                        github_token, repo_owner, repo_name, 
+                        st.session_state.openai_key if st.session_state.openai_key else None
+                    )
                     
-                    # Simulate data loading steps
-                    steps = [
-                        "Connecting to GitHub API",
-                        "Fetching repository information", 
-                        "Loading commit history",
-                        "Processing pull requests",
-                        "Analyzing code reviews",
-                        "Calculating metrics"
-                    ]
-                    
-                    for i, step in enumerate(steps):
-                        progress = (i + 1) / len(steps)
-                        update_progress(progress, step)
-                        time.sleep(0.5)  # Simulate processing time
-                    
-                    # This will be implemented in later tasks
-                    show_info("Data loading will be fully implemented in upcoming tasks.")
-                    st.session_state.data_loaded = True
-                    
-                except Exception as e:
-                    show_error(f"Data loading failed: {str(e)}")
-                    st.session_state.data_loaded = False
+                    if test_results['success']:
+                        st.success("✅ End-to-end workflow test completed successfully!")
+                        
+                        # Show test results
+                        with st.expander("📊 Test Results Details"):
+                            st.markdown("**Steps Completed:**")
+                            for step in test_results['steps_completed']:
+                                st.write(f"✅ {step}")
+                            
+                            if test_results['errors']:
+                                st.markdown("**Warnings/Errors:**")
+                                for error in test_results['errors']:
+                                    st.warning(f"⚠️ {error}")
+                            
+                            if test_results['metrics_summary']:
+                                st.markdown("**Metrics Summary:**")
+                                st.json(test_results['metrics_summary'])
+                    else:
+                        st.error("❌ End-to-end workflow test failed")
+                        if test_results['errors']:
+                            for error in test_results['errors']:
+                                st.error(f"Error: {error}")
+        
+        with col2:
+            # Load Data button
+            if st.button("📊 Load Repository Data", type="primary", disabled=is_loading("data_loading")):
+                with loading_context("data_loading", "Loading repository data...") as update_progress:
+                    try:
+                        # Perform integrated end-to-end data collection workflow
+                        success = perform_integrated_data_collection(
+                            github_token, repo_owner, repo_name, update_progress
+                        )
+                        
+                        if success:
+                            st.session_state.data_loaded = True
+                            show_success("Repository data loaded successfully! You can now view metrics and generate insights.")
+                        else:
+                            st.session_state.data_loaded = False
+                            show_error("Data loading failed. Please check your configuration and try again.")
+                        
+                    except Exception as e:
+                        show_error(f"Data loading failed: {str(e)}")
+                        st.session_state.data_loaded = False
     else:
         st.info("Complete the configuration above to start analyzing productivity data.")
+    
+    # Cache management section
+    st.markdown("---")
+    st.subheader("🚀 Performance & Caching")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        # Cache status
+        cache_entries = len(st.session_state.github_data_cache) + len(st.session_state.metrics_cache)
+        st.metric("Cache Entries", cache_entries, help="Number of cached data items")
+    
+    with col2:
+        # Cache hit ratio
+        hits = st.session_state.performance_metrics.get('cache_hits', 0)
+        misses = st.session_state.performance_metrics.get('cache_misses', 0)
+        total = hits + misses
+        hit_ratio = (hits / total * 100) if total > 0 else 0
+        st.metric("Cache Hit Ratio", f"{hit_ratio:.1f}%", help="Percentage of requests served from cache")
+    
+    with col3:
+        # API calls saved
+        api_calls = st.session_state.performance_metrics.get('api_calls_made', 0)
+        st.metric("API Calls Made", api_calls, help="Total GitHub API calls in this session")
+    
+    # Cache management buttons
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("🗑️ Clear Cache", help="Clear all cached data to force fresh API calls"):
+            st.session_state.github_data_cache.clear()
+            st.session_state.metrics_cache.clear()
+            st.session_state.cache_timestamps.clear()
+            st.success("Cache cleared successfully!")
+            st.rerun()
+    
+    with col2:
+        if st.button("🧹 Clear Expired", help="Remove only expired cache entries"):
+            clear_expired_cache()
+            st.success("Expired cache entries cleared!")
+            st.rerun()
+    
+    with col3:
+        if st.button("📊 Reset Performance", help="Reset performance metrics counters"):
+            st.session_state.performance_metrics = {
+                'data_load_time': 0,
+                'metrics_calc_time': 0,
+                'chart_render_time': 0,
+                'api_calls_made': 0,
+                'cache_hits': 0,
+                'cache_misses': 0
+            }
+            st.success("Performance metrics reset!")
+            st.rerun()
 
 def render_sidebar_navigation():
     """Render sidebar navigation and configuration"""
@@ -335,15 +898,19 @@ def render_sidebar_navigation():
         render_configuration_panel()
 
 def get_sample_metrics():
-    """Generate sample metrics for demonstration"""
+    """Get metrics data - either integrated real data or sample data for demonstration"""
     from datetime import datetime, timedelta
     from models.metrics import ProductivityMetrics, CommitMetrics, PRMetrics, ReviewMetrics, IssueMetrics, VelocityPoint
+    
+    # Return integrated metrics if available (from real data collection)
+    if hasattr(st.session_state, 'integrated_metrics') and st.session_state.integrated_metrics:
+        return st.session_state.integrated_metrics
     
     # Create sample data when real data is not available
     if not st.session_state.data_loaded:
         return None
     
-    # Sample metrics (in real implementation, this would come from data processing)
+    # Sample metrics (fallback when integrated data is not available)
     period_start = datetime.now() - timedelta(days=30)
     period_end = datetime.now()
     
@@ -555,7 +1122,10 @@ def render_overview_section():
     
     with col2:
         if st.session_state.data_loaded:
-            st.success("✅ Data Loaded")
+            if hasattr(st.session_state, 'integrated_metrics') and st.session_state.integrated_metrics:
+                st.success("✅ Real Data Loaded")
+            else:
+                st.success("✅ Sample Data Loaded")
         else:
             st.info("📊 No Data Loaded")
     
@@ -569,6 +1139,51 @@ def render_overview_section():
     
     # Get metrics data
     metrics = get_sample_metrics()
+    
+    # Show repository information if real data is loaded
+    if hasattr(st.session_state, 'repository_info') and st.session_state.repository_info:
+        repo_info = st.session_state.repository_info
+        st.markdown("---")
+        st.subheader("📁 Repository Information")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Repository", f"{repo_info['owner']}/{repo_info['name']}")
+        with col2:
+            st.metric("Last Updated", repo_info['last_updated'].strftime("%Y-%m-%d %H:%M"))
+        with col3:
+            st.metric("Commits", repo_info['data_points']['commits'])
+        with col4:
+            st.metric("Pull Requests", repo_info['data_points']['pull_requests'])
+        
+        # Performance metrics
+        if 'cache_performance' in repo_info:
+            st.markdown("**Performance Metrics**")
+            perf_col1, perf_col2, perf_col3, perf_col4 = st.columns(4)
+            
+            with perf_col1:
+                cache_hits = repo_info['cache_performance']['cache_hits']
+                st.metric("Cache Hits", cache_hits, help="Number of times cached data was used")
+            
+            with perf_col2:
+                api_calls = repo_info['cache_performance']['api_calls_made']
+                st.metric("API Calls", api_calls, help="Number of GitHub API calls made")
+            
+            with perf_col3:
+                load_time = st.session_state.performance_metrics.get('data_load_time', 0)
+                st.metric("Load Time", f"{load_time:.1f}s", help="Total data loading time")
+            
+            with perf_col4:
+                cache_ratio = cache_hits / (cache_hits + api_calls) * 100 if (cache_hits + api_calls) > 0 else 0
+                st.metric("Cache Efficiency", f"{cache_ratio:.1f}%", help="Percentage of requests served from cache")
+            
+            # Show performance optimization benefits
+            if cache_ratio > 50:
+                st.success("🚀 Great cache performance! API calls are being minimized effectively.")
+            elif cache_ratio > 20:
+                st.info("⚡ Good cache performance. Some API calls are being saved.")
+            elif api_calls > 0:
+                st.warning("🔄 Consider refreshing data less frequently to improve cache efficiency.")
     
     # Render metrics summary
     render_metrics_summary(metrics)
@@ -592,8 +1207,30 @@ def render_overview_section():
             with col2:
                 if st.button("🔄 Refresh Data", help="Reload data from GitHub"):
                     with st.spinner("Refreshing data..."):
-                        # In real implementation, this would reload data
-                        st.success("Data refreshed successfully!")
+                        # Clear relevant cache entries to force fresh data
+                        if hasattr(st.session_state, 'repository_info') and st.session_state.repository_info:
+                            repo_info = st.session_state.repository_info
+                            repo_owner = repo_info['owner']
+                            repo_name = repo_info['name']
+                            
+                            # Clear cache for this repository
+                            keys_to_remove = []
+                            for cache_key in st.session_state.github_data_cache.keys():
+                                if f"{repo_owner}/{repo_name}" in str(cache_key):
+                                    keys_to_remove.append(cache_key)
+                            
+                            for key in keys_to_remove:
+                                st.session_state.github_data_cache.pop(key, None)
+                                st.session_state.metrics_cache.pop(key, None)
+                                st.session_state.cache_timestamps.pop(key, None)
+                            
+                            # Trigger data reload
+                            st.session_state.data_loaded = False
+                            st.session_state.integrated_metrics = None
+                            
+                            st.success("Cache cleared! Click 'Load Repository Data' to refresh with latest data.")
+                        else:
+                            st.info("No data to refresh. Load repository data first.")
                         st.rerun()
 
 def render_metrics_section():
@@ -1918,19 +2555,33 @@ def render_export_section():
         render_ai_reports_export_section(metrics)
 
 def render_main_content():
-    """Render main content area based on selected section"""
+    """Render main content area based on selected section with lazy loading optimization"""
     current_section = st.session_state.current_section
+    
+    # Performance optimization: Only render the active section
+    # This reduces initial page load time and memory usage
+    
+    render_start_time = time.time()
     
     if current_section == "Overview":
         render_overview_section()
     elif current_section == "Metrics":
         render_metrics_section()
     elif current_section == "Analytics":
-        render_analytics_section()
+        # Lazy load analytics section only when needed
+        with st.spinner("Loading analytics..."):
+            render_analytics_section()
     elif current_section == "AI Insights":
-        render_ai_insights_section()
+        # Lazy load AI insights section only when needed
+        with st.spinner("Loading AI insights..."):
+            render_ai_insights_section()
     elif current_section == "Export":
         render_export_section()
+    
+    # Track rendering performance
+    render_time = time.time() - render_start_time
+    if render_time > 0.1:  # Only track if rendering took significant time
+        st.session_state.performance_metrics['chart_render_time'] += render_time
 
 def main():
     """Main application entry point"""

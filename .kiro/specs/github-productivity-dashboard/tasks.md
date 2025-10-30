@@ -125,8 +125,8 @@
   - Add success/error notifications throughout the application
   - _Requirements: 1.5, 2.5_
 
-- [ ] 11. Final integration and application testing
-- [ ] 11.1 Connect all components and test end-to-end workflows
+- [-] 11. Final integration and application testing
+- [-] 11.1 Connect all components and test end-to-end workflows
   - Integrate GitHub data collection with metrics processing and visualization
   - Test complete workflow from credential input to insight generation
   - _Requirements: 1.1, 2.1, 3.1, 4.1, 5.1_
